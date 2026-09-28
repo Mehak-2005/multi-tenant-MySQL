@@ -43,8 +43,8 @@ jobs:
 
       - name: Validate SAM template
         run: |
-          sam validate
+          sam validate --region ap-south-1
 
       - name: Build SAM application
         run: |
-          sam build
+          sam build --region ap-south-1

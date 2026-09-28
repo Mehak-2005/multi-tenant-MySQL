@@ -1,0 +1,2403 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  Multi-tenant MySQL Provisioning Service on AWS
+
+
+# ============================================================
+# PARAMETERS
+# ============================================================
+
+Parameters:
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    Description: Deployment environment
+
+
+  MaxTenantsPerHost:
+    Type: Number
+    Default: 5
+    Description: Maximum number of tenants allowed on one EC2 MySQL host
+
+
+  MySQLPort:
+    Type: Number
+    Default: 3307
+    Description: Non-default port used by MySQL
+
+
+  MySQLInstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+    Description: EC2 instance type for MySQL hosts
+
+
+  UbuntuAmiSsmParameter:
+    Type: String
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+    Description: Public SSM parameter for the latest Ubuntu 24.04 LTS AMD64 AMI
+
+
+# ============================================================
+# RESOURCES
+# ============================================================
+
+Resources:
+
+
+  # ==========================================================
+  # TENANTS TABLE
+  # ==========================================================
+
+  TenantsTable:
+    Type: AWS::DynamoDB::Table
+
+    Properties:
+
+      TableName: !Sub multi-tenant-mysql-tenants-${Environment}
+
+      BillingMode: PAY_PER_REQUEST
+
+      AttributeDefinitions:
+        - AttributeName: tenant_id
+          AttributeType: S
+
+      KeySchema:
+        - AttributeName: tenant_id
+          KeyType: HASH
+
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+      Tags:
+        - Key: Project
+          Value: MultiTenantMySQL
+
+        - Key: Environment
+          Value: !Ref Environment
+
+
+  # ==========================================================
+  # JOBS TABLE
+  # ==========================================================
+
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+
+    Properties:
+
+      TableName: !Sub multi-tenant-mysql-jobs-${Environment}
+
+      BillingMode: PAY_PER_REQUEST
+
+      AttributeDefinitions:
+        - AttributeName: job_id
+          AttributeType: S
+
+      KeySchema:
+        - AttributeName: job_id
+          KeyType: HASH
+
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+      Tags:
+        - Key: Project
+          Value: MultiTenantMySQL
+
+        - Key: Environment
+          Value: !Ref Environment
+
+
+  # ==========================================================
+  # HOSTS TABLE
+  # ==========================================================
+
+  HostsTable:
+    Type: AWS::DynamoDB::Table
+
+    Properties:
+
+      TableName: !Sub multi-tenant-mysql-hosts-${Environment}
+
+      BillingMode: PAY_PER_REQUEST
+
+      AttributeDefinitions:
+        - AttributeName: host_id
+          AttributeType: S
+
+      KeySchema:
+        - AttributeName: host_id
+          KeyType: HASH
+
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+      Tags:
+        - Key: Project
+          Value: MultiTenantMySQL
+
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ==========================================================
+  # TENANT BACKUP S3 BUCKET
+  # ==========================================================
+
+  TenantBackupBucket:
+    Type: AWS::S3::Bucket
+
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+
+    Properties:
+
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+      VersioningConfiguration:
+        Status: Enabled
+  # ==========================================================
+  # VPC
+  # ==========================================================
+
+  MySQLVpc:
+    Type: AWS::EC2::VPC
+
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+      Tags:
+        - Key: Name
+          Value: multi-tenant-mysql-vpc
+
+        - Key: Project
+          Value: MultiTenantMySQL
+
+        - Key: Environment
+          Value: !Ref Environment
+
+
+  # ==========================================================
+  # INTERNET GATEWAY
+  # ==========================================================
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+    Properties:
+      Tags:
+        - Key: Name
+          Value: multi-tenant-mysql-igw
+
+
+  AttachInternetGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+
+    Properties:
+      VpcId: !Ref MySQLVpc
+      InternetGatewayId: !Ref InternetGateway
+
+
+  # ==========================================================
+  # PUBLIC SUBNET
+  # Used only for NAT Gateway
+  # ==========================================================
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+
+    Properties:
+      VpcId: !Ref MySQLVpc
+      CidrBlock: 10.0.100.0/24
+
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: ''
+
+      MapPublicIpOnLaunch: true
+
+      Tags:
+        - Key: Name
+          Value: multi-tenant-mysql-public-subnet
+
+
+  # ==========================================================
+  # PRIVATE SUBNET A
+  # ==========================================================
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+
+    Properties:
+      VpcId: !Ref MySQLVpc
+      CidrBlock: 10.0.1.0/24
+
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: ''
+
+      MapPublicIpOnLaunch: false
+
+      Tags:
+        - Key: Name
+          Value: multi-tenant-mysql-private-a
+
+
+  # ==========================================================
+  # PRIVATE SUBNET B
+  # ==========================================================
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+
+    Properties:
+      VpcId: !Ref MySQLVpc
+      CidrBlock: 10.0.2.0/24
+
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: ''
+
+      MapPublicIpOnLaunch: false
+
+      Tags:
+        - Key: Name
+          Value: multi-tenant-mysql-private-b
+
+
+  # ==========================================================
+  # ELASTIC IP FOR NAT GATEWAY
+  # ==========================================================
+
+  NatEip:
+    Type: AWS::EC2::EIP
+
+    DependsOn: AttachInternetGateway
+
+    Properties:
+      Domain: vpc
+
+      Tags:
+        - Key: Name
+          Value: multi-tenant-mysql-nat-eip
+
+
+  # ==========================================================
+  # NAT GATEWAY
+  # ==========================================================
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet
+
+      Tags:
+        - Key: Name
+          Value: multi-tenant-mysql-nat
+
+
+  # ==========================================================
+  # PUBLIC ROUTE TABLE
+  # ==========================================================
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+
+    Properties:
+      VpcId: !Ref MySQLVpc
+
+      Tags:
+        - Key: Name
+          Value: multi-tenant-mysql-public-routes
+
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+
+    DependsOn: AttachInternetGateway
+
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+
+
+  # ==========================================================
+  # PRIVATE ROUTE TABLE
+  # ==========================================================
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+
+    Properties:
+      VpcId: !Ref MySQLVpc
+
+      Tags:
+        - Key: Name
+          Value: multi-tenant-mysql-private-routes
+
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+
+  # ==========================================================
+  # PRIVATE SUBNET ROUTE ASSOCIATIONS
+  # ==========================================================
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnetA
+
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnetB
+
+
+  # ==========================================================
+  # LAMBDA SECURITY GROUP
+  # ==========================================================
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+
+    Properties:
+      GroupDescription: Security group for VPC-attached Lambda functions
+      VpcId: !Ref MySQLVpc
+
+      Tags:
+        - Key: Name
+          Value: multi-tenant-mysql-lambda-sg
+
+
+  # ==========================================================
+  # MYSQL EC2 SECURITY GROUP
+  # ==========================================================
+
+  MySQLSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+
+    Properties:
+      GroupDescription: Security group for private MySQL EC2 hosts
+      VpcId: !Ref MySQLVpc
+
+      Tags:
+        - Key: Name
+          Value: multi-tenant-mysql-ec2-sg
+
+
+  # ==========================================================
+  # LAMBDA TO MYSQL
+  # ==========================================================
+
+  MySQLFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+
+    Properties:
+      GroupId: !Ref MySQLSecurityGroup
+
+      IpProtocol: tcp
+
+      FromPort: !Ref MySQLPort
+      ToPort: !Ref MySQLPort
+
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+
+
+  # ==========================================================
+  # EC2 IAM ROLE
+  # ==========================================================
+
+  MySQLEc2Role:
+    Type: AWS::IAM::Role
+
+    Properties:
+      RoleName: !Sub multi-tenant-mysql-ec2-role-${Environment}
+
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+
+        Statement:
+          - Effect: Allow
+
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+
+            Action:
+              - sts:AssumeRole
+
+
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+
+      Policies:
+        # ----------------------------------------------------
+        # EC2 can retrieve only this project's host secrets.
+        # ----------------------------------------------------
+        - PolicyName: ReadMySQLBootstrapSecrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:multi-tenant-mysql/hosts/${Environment}/*
+        - PolicyName: DownloadTenantBackups
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  !Sub ${TenantBackupBucket.Arn}/tenants/*
+        # ----------------------------------------------------
+        # EC2 can upload tenant backups to the dedicated
+        # backup bucket.
+        # ----------------------------------------------------
+
+        - PolicyName: UploadTenantBackups
+
+          PolicyDocument:
+            Version: '2012-10-17'
+
+            Statement:
+
+              - Effect: Allow
+
+                Action:
+                  - s3:PutObject
+                  - s3:AbortMultipartUpload
+
+                Resource:
+                  !Sub ${TenantBackupBucket.Arn}/tenants/*
+
+              - Effect: Allow
+
+                Action:
+                  - s3:ListBucketMultipartUploads
+
+                Resource:
+                  !GetAtt TenantBackupBucket.Arn
+
+              - Effect: Allow
+
+                Action:
+                  - s3:ListMultipartUploadParts
+
+                Resource:
+                  !Sub ${TenantBackupBucket.Arn}/tenants/*
+  # ==========================================================
+  # EC2 INSTANCE PROFILE
+  # ==========================================================
+
+  MySQLEc2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+
+    Properties:
+      InstanceProfileName: !Sub multi-tenant-mysql-ec2-profile-${Environment}
+
+      Roles:
+        - !Ref MySQLEc2Role
+
+
+  # ==========================================================
+  # HOST PROVISIONING LAMBDA
+  # ==========================================================
+
+  ProvisionHostFunction:
+    Type: AWS::Serverless::Function
+
+    Properties:
+      FunctionName: !Sub multi-tenant-mysql-provision-host-${Environment}
+
+      CodeUri: src/
+
+      Handler: workers.host_provisioner.handler
+
+      Runtime: python3.13
+
+      Timeout: 120
+
+      MemorySize: 512
+
+
+      Environment:
+        Variables:
+
+          MYSQL_SECURITY_GROUP_ID:
+            !Ref MySQLSecurityGroup
+
+          EC2_INSTANCE_PROFILE_NAME:
+            !Ref MySQLEc2InstanceProfile
+
+          MYSQL_INSTANCE_TYPE:
+            !Ref MySQLInstanceType
+
+          MYSQL_PORT:
+            !Ref MySQLPort
+
+          UBUNTU_AMI_SSM_PARAMETER:
+            !Ref UbuntuAmiSsmParameter
+
+          SECRET_PREFIX:
+            !Sub multi-tenant-mysql/hosts/${Environment}/
+
+          ENVIRONMENT:
+            !Ref Environment
+
+
+      Policies:
+        - Statement:
+            # ==================================================
+            # CLOUDWATCH LOGGING
+            # ==================================================
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: "*"
+            # ==================================================
+            # CREATE BOOTSTRAP SECRET
+            # ==================================================
+            - Effect: Allow
+              Action:
+                - secretsmanager:CreateSecret
+              Resource: "*"
+              Condition:
+                StringLike:
+                  secretsmanager:Name:
+                    !Sub multi-tenant-mysql/hosts/${Environment}/*
+            # ==================================================
+            # DESCRIBE EXISTING SECRET
+            # Needed for safe retries
+            # ==================================================
+
+            - Effect: Allow
+
+              Action:
+                - secretsmanager:DescribeSecret
+
+              Resource:
+                !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:multi-tenant-mysql/hosts/${Environment}/*
+
+
+            # ==================================================
+            # DELETE BOOTSTRAP SECRET AFTER FAILED EC2 LAUNCH
+            # ==================================================
+
+            - Effect: Allow
+
+              Action:
+                - secretsmanager:DeleteSecret
+
+              Resource:
+                !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:multi-tenant-mysql/hosts/${Environment}/*
+
+
+            # ==================================================
+            # RESOLVE UBUNTU AMI
+            # ==================================================
+
+            - Effect: Allow
+
+              Action:
+                - ssm:GetParameter
+
+              Resource:
+                !Sub arn:aws:ssm:${AWS::Region}::parameter${UbuntuAmiSsmParameter}
+
+
+            # ==================================================
+            # LAUNCH EC2
+            #
+            # Resource "*" is being used here so the current
+            # RunInstances authorization issue is resolved.
+            #
+            # The instance type is still restricted.
+            #
+            # We can tighten this further after the first
+            # successful provisioning test.
+            # ==================================================
+
+            - Effect: Allow
+              Action:
+                - ec2:RunInstances
+              Resource:
+                - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}::image/*
+                - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${PrivateSubnetA}
+                - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${PrivateSubnetB}
+                - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*
+                - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*
+                - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${MySQLSecurityGroup}
+              Condition:
+                StringEqualsIfExists:
+                  ec2:InstanceType:
+                    !Ref MySQLInstanceType
+
+
+            # ==================================================
+            # PASS ONLY OUR MYSQL EC2 ROLE
+            # ==================================================
+
+            - Effect: Allow
+
+              Action:
+                - iam:PassRole
+
+              Resource:
+                !GetAtt MySQLEc2Role.Arn
+
+              Condition:
+                StringEquals:
+                  iam:PassedToService: ec2.amazonaws.com
+
+
+            # ==================================================
+            # CREATE EC2/VOLUME TAGS DURING RUNINSTANCES
+            # ==================================================
+
+            - Effect: Allow
+              Action:
+                - ec2:CreateTags
+              Resource:
+                - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*
+                - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*
+
+              Condition:
+
+                StringEquals:
+                  ec2:CreateAction: RunInstances
+
+                ForAllValues:StringEquals:
+                  aws:TagKeys:
+                    - Name
+                    - Project
+                    - Environment
+                    - ManagedBy
+
+
+
+# ==========================================================
+# HOST READINESS / REGISTRATION LAMBDA
+# ==========================================================
+
+  RegisterHostFunction:
+    Type: AWS::Serverless::Function
+
+    Properties:
+      FunctionName: !Sub multi-tenant-mysql-register-host-${Environment}
+
+      CodeUri: src/
+
+      Handler: workers.host_registration.handler
+
+      Runtime: python3.13
+
+      Timeout: 30
+
+      MemorySize: 512
+
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+
+      Environment:
+        Variables:
+
+          HOSTS_TABLE_NAME:
+            !Ref HostsTable
+
+          MAX_TENANTS_PER_HOST:
+            !Ref MaxTenantsPerHost
+
+          MYSQL_PORT:
+            !Ref MySQLPort
+
+          ENVIRONMENT:
+            !Ref Environment
+
+      Policies:
+
+        - Statement:
+
+            # ==================================================
+            # CLOUDWATCH
+            # ==================================================
+
+            - Effect: Allow
+
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+
+              Resource: "*"
+            # ==================================================
+            # READ HOST SECRET
+            # ==================================================
+
+            - Effect: Allow
+
+              Action:
+                - secretsmanager:GetSecretValue
+
+              Resource:
+                !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:multi-tenant-mysql/hosts/${Environment}/*
+            # ==================================================
+            # REGISTER HOST IN DYNAMODB
+            # ==================================================
+
+            - Effect: Allow
+
+              Action:
+                - dynamodb:PutItem
+
+              Resource:
+                !GetAtt HostsTable.Arn
+
+
+  # ==========================================================
+  # TENANT PLACEMENT FUNCTION
+  # ==========================================================
+
+  TenantPlacementFunction:
+    Type: AWS::Serverless::Function
+
+    Properties:
+      FunctionName: !Sub multi-tenant-mysql-tenant-placement-${Environment}
+
+      CodeUri: src/
+
+      Handler: placement.tenant_placement.handler
+
+      Runtime: python3.13
+
+      Timeout: 30
+
+      MemorySize: 256
+
+      Environment:
+        Variables:
+
+          HOSTS_TABLE_NAME:
+            !Ref HostsTable
+
+          ENVIRONMENT:
+            !Ref Environment
+
+      Policies:
+
+        - Statement:
+
+            # ==================================================
+            # CLOUDWATCH LOGGING
+            # ==================================================
+
+            - Effect: Allow
+
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+
+              Resource: "*"
+
+
+            # ==================================================
+            # HOST PLACEMENT
+            # ==================================================
+
+            - Effect: Allow
+
+              Action:
+                - dynamodb:Scan
+                - dynamodb:UpdateItem
+
+              Resource:
+                !GetAtt HostsTable.Arn
+
+  # ==========================================================
+  # TENANT PROVISIONING FUNCTION
+  # ==========================================================
+
+  TenantProvisionerFunction:
+    Type: AWS::Serverless::Function
+
+    Properties:
+      FunctionName: !Sub multi-tenant-mysql-tenant-provisioner-${Environment}
+
+      CodeUri: src/
+
+      Handler: workers.tenant_provisioner.handler
+
+      Runtime: python3.13
+
+      Timeout: 60
+
+      MemorySize: 512
+
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+
+      Environment:
+        Variables:
+
+          HOSTS_TABLE_NAME:
+            !Ref HostsTable
+
+          TENANTS_TABLE_NAME:
+            !Ref TenantsTable
+
+          MYSQL_PORT:
+            !Ref MySQLPort
+
+          SECRET_PREFIX:
+            !Sub multi-tenant-mysql/hosts/${Environment}/
+
+          ENVIRONMENT:
+            !Ref Environment
+
+      Policies:
+
+        - Statement:
+
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:Scan
+              Resource:
+                !GetAtt TenantsTable.Arn
+
+            # ==================================================
+            # CLOUDWATCH LOGGING
+            # ==================================================
+
+            - Effect: Allow
+
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+
+              Resource: "*"
+
+
+            # ==================================================
+            # READ HOST INFORMATION
+            # ==================================================
+
+            - Effect: Allow
+
+              Action:
+                - dynamodb:GetItem
+
+              Resource:
+                !GetAtt HostsTable.Arn
+
+
+            # ==================================================
+            # STORE TENANT INFORMATION
+            # ==================================================
+
+            - Effect: Allow
+
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+
+              Resource:
+                !GetAtt TenantsTable.Arn
+
+
+            # ==================================================
+            # READ MYSQL ADMIN SECRET
+            # ==================================================
+
+            - Effect: Allow
+
+              Action:
+                - secretsmanager:GetSecretValue
+
+              Resource:
+                !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:multi-tenant-mysql/hosts/${Environment}/*
+
+            # ==================================================
+            # CREATE TENANT CREDENTIAL SECRET
+            # ==================================================
+
+            - Effect: Allow
+
+              Action:
+                - secretsmanager:CreateSecret
+
+              Resource: "*"
+
+              Condition:
+                StringLike:
+                  secretsmanager:Name:
+                    !Sub multi-tenant-mysql/tenants/${Environment}/*
+
+            # ==================================================
+            # TAG TENANT CREDENTIAL SECRETS
+            # ==================================================
+
+            - Effect: Allow
+
+              Action:
+                - secretsmanager:TagResource
+
+              Resource:
+                !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:multi-tenant-mysql/tenants/${Environment}/*
+            # ==================================================
+            # CHECK EXISTING TENANT SECRET
+            # ==================================================
+
+            - Effect: Allow
+
+              Action:
+                - secretsmanager:DescribeSecret
+
+              Resource:
+                !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:multi-tenant-mysql/tenants/${Environment}/*
+
+            - Effect: Allow
+
+              Action:
+                - secretsmanager:PutSecretValue
+
+              Resource:
+                !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:multi-tenant-mysql/tenants/${Environment}/*
+
+  # ==========================================================
+  # TENANT DEPROVISIONING FUNCTION
+  # ==========================================================
+
+  TenantDeprovisionerFunction:
+    Type: AWS::Serverless::Function
+
+    Properties:
+      FunctionName: !Sub multi-tenant-mysql-tenant-deprovisioner-${Environment}
+
+      CodeUri: src/
+
+      Handler: workers.tenant_deprovisioner.handler
+
+      Runtime: python3.13
+
+      Timeout: 60
+
+      MemorySize: 512
+
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+
+      Environment:
+        Variables:
+
+          HOSTS_TABLE_NAME:
+            !Ref HostsTable
+
+          TENANTS_TABLE_NAME:
+            !Ref TenantsTable
+
+          MYSQL_PORT:
+            !Ref MySQLPort
+
+          ENVIRONMENT:
+            !Ref Environment
+
+      Policies:
+        - Statement:
+
+            # ==================================================
+            # CLOUDWATCH LOGGING
+            # ==================================================
+
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: "*"
+
+
+            # ==================================================
+            # TENANT TABLE
+            # ==================================================
+
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+              Resource:
+                !GetAtt TenantsTable.Arn
+
+
+            # ==================================================
+            # HOST TABLE
+            # ==================================================
+
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+              Resource:
+                !GetAtt HostsTable.Arn
+
+
+            # ==================================================
+            # READ HOST SECRETS
+            # ==================================================
+
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:multi-tenant-mysql/hosts/${Environment}/*
+
+
+            # ==================================================
+            # DELETE TENANT CREDENTIAL SECRETS
+            # ==================================================
+
+            - Effect: Allow
+              Action:
+                - secretsmanager:DeleteSecret
+              Resource:
+                !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:multi-tenant-mysql/tenants/${Environment}/*
+
+
+            # ==================================================
+            # TERMINATE MYSQL HOST
+            # ==================================================
+
+            - Effect: Allow
+              Action:
+                - ec2:TerminateInstances
+              Resource:
+                - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+              Condition:
+                StringEquals:
+                  ec2:ResourceTag/Project: MultiTenantMySQL
+                  ec2:ResourceTag/Environment: !Ref Environment
+
+    # ==========================================================
+  # TENANT QUERY FUNCTION
+  # ==========================================================
+
+  TenantQueryFunction:
+    Type: AWS::Serverless::Function
+
+    Properties:
+      FunctionName: !Sub multi-tenant-mysql-tenant-query-${Environment}
+
+      CodeUri: src/
+
+      Handler: workers.tenant_query.handler
+
+      Runtime: python3.13
+
+      Timeout: 60
+
+      MemorySize: 512
+
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+
+      Environment:
+        Variables:
+
+          TENANTS_TABLE_NAME:
+            !Ref TenantsTable
+
+          HOSTS_TABLE_NAME:
+            !Ref HostsTable
+
+          MYSQL_PORT:
+            !Ref MySQLPort
+
+          ENVIRONMENT:
+            !Ref Environment
+
+      Policies:
+        - Statement:
+            # ==================================================
+            # CLOUDWATCH LOGGING
+            # ==================================================
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: "*"
+            # ==================================================
+            # READ TENANT
+            # ==================================================
+
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+              Resource:
+                !GetAtt TenantsTable.Arn
+            # ==================================================
+            # READ HOST
+            # ==================================================
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+              Resource:
+                !GetAtt HostsTable.Arn
+            # ==================================================
+            # READ TENANT CREDENTIAL SECRET
+            # ==================================================
+
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:multi-tenant-mysql/tenants/${Environment}/*
+
+  # ==========================================================
+  # TENANT BACKUP FUNCTION
+  # ==========================================================
+
+  TenantBackupFunction:
+    Type: AWS::Serverless::Function
+
+    Properties:
+      FunctionName: !Sub multi-tenant-mysql-tenant-backup-${Environment}
+
+      CodeUri: src/
+
+      Handler: workers.tenant_backup.handler
+
+      Runtime: python3.13
+
+      Timeout: 30
+
+      MemorySize: 512
+
+      Environment:
+        Variables:
+
+          TENANTS_TABLE_NAME:
+            !Ref TenantsTable
+
+          HOSTS_TABLE_NAME:
+            !Ref HostsTable
+
+          BACKUP_BUCKET_NAME:
+            !Ref TenantBackupBucket
+
+          ENVIRONMENT:
+            !Ref Environment
+
+      Policies:
+        - Statement:
+            # ==================================================
+            # CLOUDWATCH LOGGING
+            # ==================================================
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: "*"
+            # ==================================================
+            # READ TENANT
+            # ==================================================
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+              Resource:
+                !GetAtt TenantsTable.Arn
+            # ==================================================
+            # READ HOST
+            # ==================================================
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+              Resource:
+                !GetAtt HostsTable.Arn
+            # ==================================================
+            # START SSM COMMAND
+            # ==================================================
+            - Effect: Allow
+              Action:
+                - ssm:SendCommand
+              Resource:
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript
+
+            - Effect: Allow
+              Action:
+                - ssm:SendCommand
+              Resource:
+                - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+              Condition:
+                StringEquals:
+                  ssm:resourceTag/Project: MultiTenantMySQL
+                  ssm:resourceTag/Environment: !Ref Environment
+  # ==========================================================
+  # TENANT RESTORE FUNCTION
+  # ==========================================================
+
+  TenantRestoreFunction:
+    Type: AWS::Serverless::Function
+
+    Properties:
+
+      FunctionName:
+        !Sub multi-tenant-mysql-tenant-restore-${Environment}
+
+      CodeUri: src/
+
+      Handler: workers.tenant_restore.handler
+
+      Runtime: python3.13
+
+      Timeout: 30
+
+      MemorySize: 512
+
+      Environment:
+        Variables:
+
+          TENANTS_TABLE_NAME:
+            !Ref TenantsTable
+
+          HOSTS_TABLE_NAME:
+            !Ref HostsTable
+
+          BACKUP_BUCKET_NAME:
+            !Ref TenantBackupBucket
+
+          MYSQL_PORT:
+            !Ref MySQLPort
+
+          ENVIRONMENT:
+            !Ref Environment
+
+      Policies:
+        - Statement:
+            # ==================================================
+            # CLOUDWATCH
+            # ==================================================
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: "*"
+            # ==================================================
+            # READ TENANT
+            # ==================================================
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+              Resource:
+                !GetAtt TenantsTable.Arn
+            # ==================================================
+            # READ HOST
+            # ==================================================
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+              Resource:
+                !GetAtt HostsTable.Arn
+            # ==================================================
+            # READ BACKUP FROM S3
+            # ==================================================
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource:
+                !Sub ${TenantBackupBucket.Arn}/tenants/*
+            # ==================================================
+            # SEND RESTORE COMMAND TO EC2
+            # ==================================================
+            - Effect: Allow
+              Action:
+                - ssm:SendCommand
+              Resource:
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript
+
+            - Effect: Allow
+              Action:
+                - ssm:SendCommand
+              Resource:
+                - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+              Condition:
+                StringEquals:
+                  ssm:resourceTag/Project: MultiTenantMySQL
+                  ssm:resourceTag/Environment: !Ref Environment
+  # ==========================================================
+  # TENANT API FUNCTION
+  # ==========================================================
+
+  TenantApiFunction:
+    Type: AWS::Serverless::Function
+
+    Properties:
+      FunctionName: !Sub multi-tenant-mysql-tenant-api-${Environment}
+
+      CodeUri: src/
+
+      Handler: api.tenant_api.handler
+
+      Runtime: python3.13
+
+      Timeout: 60
+
+      MemorySize: 512
+
+      Environment:
+        Variables:
+
+          JOBS_TABLE_NAME:
+            !Ref JobsTable
+
+          TENANTS_TABLE_NAME:
+            !Ref TenantsTable
+
+          HOSTS_TABLE_NAME:
+            !Ref HostsTable
+
+          STATE_MACHINE_ARN:
+            !Ref HostProvisioningStateMachine
+
+          BACKUP_FUNCTION_NAME:
+            !Ref TenantBackupFunction
+
+          RESTORE_FUNCTION_NAME:
+            !Ref TenantRestoreFunction  
+
+          DEPROVISIONER_FUNCTION_NAME:
+            !Ref TenantDeprovisionerFunction
+
+          QUERY_FUNCTION_NAME:
+            !Ref TenantQueryFunction 
+
+          ENVIRONMENT:
+            !Ref Environment
+
+      Policies:
+        - Statement:
+            # ==================================================
+            # CLOUDWATCH LOGGING
+            # ==================================================
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: "*"
+            # ==================================================
+            # START ASYNC STATE MACHINE
+            # ==================================================
+            - Effect: Allow
+              Action:
+                - states:StartExecution
+              Resource:
+                !Ref HostProvisioningStateMachine
+            # ==================================================
+            # CREATE / UPDATE JOBS
+            # ==================================================
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:GetItem
+
+              Resource:
+                !GetAtt JobsTable.Arn
+            # ==================================================
+            # CHECK EXISTING TENANT
+            # ==================================================
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+              Resource:
+                !GetAtt TenantsTable.Arn
+            # ==================================================
+            # LIST MYSQL HOSTS
+            # ==================================================
+            - Effect: Allow
+              Action:
+                - dynamodb:Scan
+              Resource:
+                !GetAtt HostsTable.Arn
+                        # ==================================================
+            # INVOKE TENANT DEPROVISIONER
+            # ==================================================
+
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource:
+                !GetAtt TenantDeprovisionerFunction.Arn
+
+                        # ==================================================
+            # INVOKE TENANT QUERY
+            # ==================================================
+
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource:
+                !GetAtt TenantQueryFunction.Arn  
+                            # ==================================================
+            # INVOKE TENANT BACKUP
+            # ==================================================
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource:
+                !GetAtt TenantBackupFunction.Arn
+
+            # ==================================================
+            # INVOKE TENANT RESTORE
+            # ==================================================
+
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource:
+                !GetAtt TenantRestoreFunction.Arn
+
+      Events:
+
+
+        # ------------------------------------------------------
+        # GET /tenants/{tenant_id}
+        # ------------------------------------------------------
+
+        GetTenantApi:
+          Type: Api
+
+          Properties:
+            Path: /tenants/{tenant_id}
+            Method: get
+
+
+        # ------------------------------------------------------
+        # DELETE /tenants/{tenant_id}
+        # ------------------------------------------------------
+
+        DeleteTenantApi:
+          Type: Api
+
+          Properties:
+            Path: /tenants/{tenant_id}
+            Method: delete
+
+
+        # ------------------------------------------------------
+        # GET /hosts
+        # ------------------------------------------------------
+
+        GetHostsApi:
+          Type: Api
+
+          Properties:
+            Path: /hosts
+            Method: get
+
+        # ------------------------------------------------------
+        # POST /tenants
+        # Starts the workflow and returns immediately.
+        # ------------------------------------------------------
+
+        CreateTenantApi:
+          Type: Api
+
+          Properties:
+            Path: /tenants
+            Method: post
+
+
+        # ------------------------------------------------------
+        # GET /jobs/{job_id}
+        # Poll async provisioning status.
+        # ------------------------------------------------------
+
+        GetJobApi:
+          Type: Api
+
+          Properties:
+            Path: /jobs/{job_id}
+            Method: get
+
+        QueryTenantApi:
+          Type: Api
+
+          Properties:
+            Path: /tenants/{tenant_id}/query
+
+            Method: post
+
+        # ------------------------------------------------------
+        # GET /tenants/{tenant_id}/backup
+        # ------------------------------------------------------
+
+        GetTenantBackupApi:
+          Type: Api
+
+          Properties:
+            Path: /tenants/{tenant_id}/backup
+            Method: get
+
+        # ------------------------------------------------------
+        # POST /tenants/{tenant_id}/restore
+        # ------------------------------------------------------
+
+        RestoreTenantApi:
+          Type: Api
+
+          Properties:
+            Path: /tenants/{tenant_id}/restore
+            Method: post
+  # ==========================================================
+  # HOST PROVISIONING STATE MACHINE
+  # ==========================================================
+
+  HostProvisioningStateMachine:
+    Type: AWS::Serverless::StateMachine
+
+    Properties:
+      Name: !Sub multi-tenant-mysql-host-provisioning-${Environment}
+
+      DefinitionSubstitutions:
+        PlacementFunctionArn: !GetAtt TenantPlacementFunction.Arn
+        ProvisionHostFunctionArn: !GetAtt ProvisionHostFunction.Arn
+        RegisterHostFunctionArn: !GetAtt RegisterHostFunction.Arn
+        TenantProvisionerFunctionArn: !GetAtt TenantProvisionerFunction.Arn
+        PrivateSubnetA: !Ref PrivateSubnetA
+        JobsTableName: !Ref JobsTable
+        HostsTableName: !Ref HostsTable
+        TenantsTableName: !Ref TenantsTable
+
+      Definition:
+        StartAt: UpdateJobBootstrapping
+
+        States:
+
+          # ----------------------------------------------------
+          # 1. PENDING -> BOOTSTRAPPING
+          # ----------------------------------------------------
+
+          UpdateJobBootstrapping:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:dynamodb:updateItem
+
+            Parameters:
+              TableName: "${JobsTableName}"
+
+              Key:
+                job_id:
+                  S.$: "$.job_id"
+
+              UpdateExpression: >-
+                SET #status = :status,
+                    #stage = :stage,
+                    updated_at = :updated_at
+
+              ExpressionAttributeNames:
+                "#status": status
+                "#stage": stage
+
+              ExpressionAttributeValues:
+                ":status":
+                  S: BOOTSTRAPPING
+
+                ":stage":
+                  S: TENANT_PLACEMENT
+
+                ":updated_at":
+                  S.$: "$$.State.EnteredTime"
+
+            ResultPath: null
+            Next: FindAndReserveHost
+
+
+          # ----------------------------------------------------
+          # 2. TRY TO PLACE TENANT ON AN EXISTING READY HOST
+          # ----------------------------------------------------
+
+          FindAndReserveHost:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+
+            Parameters:
+              FunctionName: "${PlacementFunctionArn}"
+
+              Payload:
+                tenant_id.$: "$.tenant_id"
+                job_id.$: "$.job_id"
+
+            ResultPath: $.placement
+
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2
+
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                ResultPath: $.workflow_error
+                Next: MarkJobFailed
+
+            Next: PlacementResult
+
+
+          # ----------------------------------------------------
+          # 3. EXISTING HOST AVAILABLE OR NEW HOST REQUIRED
+          # ----------------------------------------------------
+
+          PlacementResult:
+            Type: Choice
+
+            Choices:
+
+              - Variable: $.placement.Payload.statusCode
+                NumericEquals: 200
+                Next: SetExistingHostTarget
+
+              - Variable: $.placement.Payload.statusCode
+                NumericEquals: 409
+                Next: UpdateJobHostProvisioning
+
+            Default: MarkJobFailed
+
+
+          # ----------------------------------------------------
+          # 4. EXISTING HOST PATH
+          # ----------------------------------------------------
+
+          SetExistingHostTarget:
+            Type: Pass
+
+            Parameters:
+              host_id.$: "$.placement.Payload.body.host_id"
+
+            ResultPath: $.target_host
+
+            Next: UpdateJobTenantProvisioning
+
+
+          # ----------------------------------------------------
+          # 5. UPDATE JOB BEFORE TENANT DATABASE CREATION
+          # ----------------------------------------------------
+
+          UpdateJobTenantProvisioning:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:dynamodb:updateItem
+
+            Parameters:
+              TableName: "${JobsTableName}"
+
+              Key:
+                job_id:
+                  S.$: "$.job_id"
+
+              UpdateExpression: >-
+                SET #status = :status,
+                    #stage = :stage,
+                    host_id = :host_id,
+                    updated_at = :updated_at
+
+              ExpressionAttributeNames:
+                "#status": status
+                "#stage": stage
+
+              ExpressionAttributeValues:
+                ":status":
+                  S: BOOTSTRAPPING
+
+                ":stage":
+                  S: TENANT_DATABASE
+
+                ":host_id":
+                  S.$: "$.target_host.host_id"
+
+                ":updated_at":
+                  S.$: "$$.State.EnteredTime"
+
+            ResultPath: null
+            Next: ProvisionTenant
+
+
+          # ----------------------------------------------------
+          # 6. NO CAPACITY: PROVISION A NEW HOST
+          # ----------------------------------------------------
+
+          UpdateJobHostProvisioning:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:dynamodb:updateItem
+
+            Parameters:
+              TableName: "${JobsTableName}"
+
+              Key:
+                job_id:
+                  S.$: "$.job_id"
+
+              UpdateExpression: >-
+                SET #status = :status,
+                    #stage = :stage,
+                    updated_at = :updated_at
+
+              ExpressionAttributeNames:
+                "#status": status
+                "#stage": stage
+
+              ExpressionAttributeValues:
+                ":status":
+                  S: BOOTSTRAPPING
+
+                ":stage":
+                  S: HOST_PROVISIONING
+
+                ":updated_at":
+                  S.$: "$$.State.EnteredTime"
+
+            ResultPath: null
+            Next: ProvisionHost
+
+
+          # ----------------------------------------------------
+          # 7. CREATE NEW EC2 MYSQL HOST
+          # ----------------------------------------------------
+
+          ProvisionHost:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+
+            Parameters:
+              FunctionName: "${ProvisionHostFunctionArn}"
+
+              Payload:
+                tenant_id.$: "$.tenant_id"
+                job_id.$: "$.job_id"
+                subnet_id: "${PrivateSubnetA}"
+                
+
+            ResultPath: $.provision_host
+
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2
+
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                ResultPath: $.workflow_error
+                Next: MarkJobFailed
+
+            Next: WaitForMySQLInitial
+
+
+          # ----------------------------------------------------
+          # 8. WAIT FOR USER-DATA / MYSQL BOOTSTRAP
+          # ----------------------------------------------------
+
+          WaitForMySQLInitial:
+            Type: Wait
+            Seconds: 90
+            Next: InitializeRegisterAttempt
+
+
+          # ----------------------------------------------------
+          # 9. INITIALIZE READINESS RETRY COUNTER
+          # ----------------------------------------------------
+
+          InitializeRegisterAttempt:
+            Type: Pass
+            Parameters:
+              register_attempt: 0
+            ResultPath: $.retry
+            Next: RegisterHost
+
+
+          # ----------------------------------------------------
+          # 10. VERIFY MYSQL AND REGISTER HOST
+          # ----------------------------------------------------
+
+          RegisterHost:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+
+            Parameters:
+              FunctionName: "${RegisterHostFunctionArn}"
+
+              Payload:
+                host_id.$: "$.provision_host.Payload.instance_id"
+                instance_id.$: "$.provision_host.Payload.instance_id"
+                private_ip.$: "$.provision_host.Payload.private_ip"
+                secret_arn.$: "$.provision_host.Payload.secret_arn"
+                mysql_port.$: "$.provision_host.Payload.mysql_port"
+                subnet_id.$: "$.provision_host.Payload.subnet_id"
+
+            ResultPath: $.register_host
+
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2
+
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                ResultPath: $.workflow_error
+                Next: MarkJobFailed
+
+            Next: HostRegistrationResult
+
+
+          # ----------------------------------------------------
+          # 11. MYSQL READY?
+          # ----------------------------------------------------
+
+          HostRegistrationResult:
+            Type: Choice
+
+            Choices:
+
+              - Variable: $.register_host.Payload.statusCode
+                NumericEquals: 200
+                Next: SetNewHostTarget
+
+              - Variable: $.register_host.Payload.statusCode
+                NumericEquals: 409
+                Next: CheckRegisterAttempts
+
+            Default: MarkJobFailed
+
+
+          # ----------------------------------------------------
+          # 12. LIMIT READINESS RETRIES
+          # ----------------------------------------------------
+
+          CheckRegisterAttempts:
+            Type: Choice
+
+            Choices:
+
+              - Variable: $.retry.register_attempt
+                NumericLessThan: 10
+                Next: IncrementRegisterAttempt
+
+            Default: MarkJobFailed
+
+
+          IncrementRegisterAttempt:
+            Type: Pass
+
+            Parameters:
+              register_attempt.$:
+                States.MathAdd($.retry.register_attempt, 1)
+
+            ResultPath: $.retry
+            Next: WaitForMySQLRetry
+
+
+          WaitForMySQLRetry:
+            Type: Wait
+            Seconds: 30
+            Next: RegisterHost
+
+
+          # ----------------------------------------------------
+          # 13. NEW HOST IS READY
+          # ----------------------------------------------------
+
+          SetNewHostTarget:
+            Type: Pass
+
+            Parameters:
+              host_id.$: "$.provision_host.Payload.instance_id"
+
+            ResultPath: $.target_host
+
+            Next: ReserveNewHostSlot
+
+
+          # ----------------------------------------------------
+          # 14. RESERVE ONE TENANT SLOT ON NEW HOST
+          # ----------------------------------------------------
+
+          ReserveNewHostSlot:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:dynamodb:updateItem
+
+            Parameters:
+              TableName: "${HostsTableName}"
+
+              Key:
+                host_id:
+                  S.$: "$.target_host.host_id"
+
+              UpdateExpression: >-
+                SET tenant_count = if_not_exists(tenant_count, :zero) + :one
+
+              ConditionExpression: >-
+                #status = :ready
+                AND tenant_count < #capacity
+
+              ExpressionAttributeNames:
+                "#status": status
+                "#capacity": capacity
+
+              ExpressionAttributeValues:
+                ":zero":
+                  N: "0"
+
+                ":one":
+                  N: "1"
+
+                ":ready":
+                  S: READY
+
+            ResultPath: null
+
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                ResultPath: $.workflow_error
+                Next: MarkJobFailed
+
+            Next: UpdateJobTenantProvisioning
+
+
+          # ----------------------------------------------------
+          # 15. CREATE TENANT DATABASE + USER
+          # ----------------------------------------------------
+
+          ProvisionTenant:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+
+            Parameters:
+              FunctionName: "${TenantProvisionerFunctionArn}"
+
+              Payload:
+                tenant_id.$: "$.tenant_id"
+                host_id.$: "$.target_host.host_id"
+                job_id.$: "$.job_id"
+                execution_start_time.$: "$$.Execution.StartTime"
+
+            ResultPath: $.tenant_provision
+
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2
+
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                ResultPath: $.workflow_error
+                Next: ReleaseReservedHostSlot
+
+            Next: TenantProvisionResult
+
+
+          # ----------------------------------------------------
+          # 16. CHECK TENANT PROVISIONING RESULT
+          # ----------------------------------------------------
+
+          TenantProvisionResult:
+            Type: Choice
+
+            Choices:
+
+              - Variable: $.tenant_provision.Payload.statusCode
+                NumericEquals: 200
+                Next: GetTenantRecord
+
+            Default: ReleaseReservedHostSlot
+
+
+          # ----------------------------------------------------
+          # 17. RELEASE RESERVED SLOT ON FAILURE
+          # Works for both existing-host and new-host paths.
+          # ----------------------------------------------------
+
+          ReleaseReservedHostSlot:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:dynamodb:updateItem
+
+            Parameters:
+              TableName: "${HostsTableName}"
+
+              Key:
+                host_id:
+                  S.$: "$.target_host.host_id"
+
+              UpdateExpression: >-
+                SET tenant_count = tenant_count - :one
+
+              ConditionExpression: tenant_count > :zero
+
+              ExpressionAttributeValues:
+                ":one":
+                  N: "1"
+
+                ":zero":
+                  N: "0"
+
+            ResultPath: null
+
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                ResultPath: $.rollback_error
+                Next: MarkJobFailed
+
+            Next: MarkJobFailed
+
+
+          # ----------------------------------------------------
+          # 18. READ CREATED TENANT RECORD
+          # ----------------------------------------------------
+
+          GetTenantRecord:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:dynamodb:getItem
+
+            Parameters:
+              TableName: "${TenantsTableName}"
+
+              Key:
+                tenant_id:
+                  S.$: "$.tenant_id"
+
+            ResultPath: $.tenant_record
+
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                ResultPath: $.workflow_error
+                Next: MarkJobFailed
+
+            Next: MarkJobReady
+
+
+          # ----------------------------------------------------
+          # 19. MARK JOB READY
+          # ----------------------------------------------------
+
+          MarkJobReady:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:dynamodb:updateItem
+
+            Parameters:
+              TableName: "${JobsTableName}"
+
+              Key:
+                job_id:
+                  S.$: "$.job_id"
+
+              UpdateExpression: >-
+                SET #status = :status,
+                    #stage = :stage,
+                    host_id = :host_id,
+                    database_name = :database_name,
+                    mysql_username = :mysql_username,
+                    updated_at = :updated_at
+
+              ExpressionAttributeNames:
+                "#status": status
+                "#stage": stage
+
+              ExpressionAttributeValues:
+                ":status":
+                  S: READY
+
+                ":stage":
+                  S: COMPLETED
+
+                ":host_id":
+                  S.$: "$.target_host.host_id"
+
+                ":database_name":
+                  S.$: "$.tenant_record.Item.database_name.S"
+
+                ":mysql_username":
+                  S.$: "$.tenant_record.Item.mysql_username.S"
+
+                ":updated_at":
+                  S.$: "$$.State.EnteredTime"
+
+            ResultPath: null
+            Next: WorkflowSucceeded
+
+
+          # ----------------------------------------------------
+          # 20. MARK JOB FAILED
+          # ----------------------------------------------------
+
+          MarkJobFailed:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:dynamodb:updateItem
+
+            Parameters:
+              TableName: "${JobsTableName}"
+
+              Key:
+                job_id:
+                  S.$: "$.job_id"
+
+              UpdateExpression: >-
+                SET #status = :status,
+                    #stage = :stage,
+                    #error = :error,
+                    updated_at = :updated_at
+
+              ExpressionAttributeNames:
+                "#status": status
+                "#stage": stage
+                "#error": error
+
+              ExpressionAttributeValues:
+                ":status":
+                  S: FAILED
+
+                ":stage":
+                  S: FAILED
+
+                ":error":
+                  S: Tenant provisioning workflow failed
+
+                ":updated_at":
+                  S.$: "$$.State.EnteredTime"
+
+            ResultPath: null
+            Next: WorkflowFailed
+
+
+          # ----------------------------------------------------
+          # 21. END STATES
+          # ----------------------------------------------------
+
+          WorkflowSucceeded:
+            Type: Succeed
+
+          WorkflowFailed:
+            Type: Fail
+            Error: TenantProvisioningFailed
+            Cause: Tenant provisioning workflow failed
+
+      Policies:
+        - Statement:
+
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource:
+                - !GetAtt TenantPlacementFunction.Arn
+                - !GetAtt ProvisionHostFunction.Arn
+                - !GetAtt RegisterHostFunction.Arn
+                - !GetAtt TenantProvisionerFunction.Arn
+
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+              Resource:
+                - !GetAtt JobsTable.Arn
+                - !GetAtt HostsTable.Arn
+                - !GetAtt TenantsTable.Arn
+
+
+# ============================================================
+# OUTPUTS
+# ============================================================
+
+Outputs:
+
+
+  TenantsTableName:
+    Description: DynamoDB table containing tenant information
+    Value: !Ref TenantsTable
+
+
+  JobsTableName:
+    Description: DynamoDB table containing provisioning jobs
+    Value: !Ref JobsTable
+
+
+  HostsTableName:
+    Description: DynamoDB table containing EC2 host information
+    Value: !Ref HostsTable
+
+
+  MaxTenantsPerHost:
+    Description: Maximum tenants allowed per host
+    Value: !Ref MaxTenantsPerHost
+
+
+  VpcId:
+    Description: VPC used by the multi-tenant MySQL service
+    Value: !Ref MySQLVpc
+
+
+  PublicSubnetId:
+    Description: Public subnet used by the NAT Gateway
+    Value: !Ref PublicSubnet
+
+
+  PrivateSubnetAId:
+    Description: Private subnet A for MySQL hosts
+    Value: !Ref PrivateSubnetA
+
+
+  PrivateSubnetBId:
+    Description: Private subnet B for MySQL hosts
+    Value: !Ref PrivateSubnetB
+
+
+  LambdaSecurityGroupId:
+    Description: Security group used by VPC-attached Lambda functions
+    Value: !Ref LambdaSecurityGroup
+
+
+  MySQLSecurityGroupId:
+    Description: Security group attached to MySQL EC2 hosts
+    Value: !Ref MySQLSecurityGroup
+
+
+  MySQLPort:
+    Description: Port used by MySQL
+    Value: !Ref MySQLPort
+
+
+  MySQLEc2RoleArn:
+    Description: IAM role ARN assigned to MySQL EC2 hosts
+    Value: !GetAtt MySQLEc2Role.Arn
+
+
+  MySQLEc2InstanceProfile:
+    Description: Instance profile assigned to MySQL EC2 hosts
+    Value: !Ref MySQLEc2InstanceProfile
+
+
+  ProvisionHostFunctionArn:
+    Description: ARN of the host provisioning Lambda
+    Value: !GetAtt ProvisionHostFunction.Arn
+
+
+  TenantDeprovisionerFunctionArn:
+    Description: ARN of the tenant deprovisioning Lambda
+    Value: !GetAtt TenantDeprovisionerFunction.Arn
+
+
+  HostProvisioningStateMachineArn:
+    Description: ARN of the state machine used to provision new MySQL hosts
+    Value: !Ref HostProvisioningStateMachine
+
+
+  TenantApiBaseUrl:
+    Description: Base URL for the tenant API
+    Value: !Sub https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod
+
+
+  JobsApiPath:
+    Description: API path used to poll async tenant provisioning jobs
+    Value: /jobs/{job_id}
+
+  TenantBackupBucketName:
+    Description: S3 bucket used for tenant database backups
+    Value: !Ref TenantBackupBucket

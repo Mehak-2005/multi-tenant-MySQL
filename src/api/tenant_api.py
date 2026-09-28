@@ -33,6 +33,8 @@ STATE_MACHINE_ARN = os.environ["STATE_MACHINE_ARN"]
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "dev")
 QUERY_FUNCTION_NAME = os.environ["QUERY_FUNCTION_NAME"]
 DEPROVISIONER_FUNCTION_NAME = os.environ["DEPROVISIONER_FUNCTION_NAME"]
+BACKUP_FUNCTION_NAME = os.environ["BACKUP_FUNCTION_NAME"]
+RESTORE_FUNCTION_NAME = os.environ["RESTORE_FUNCTION_NAME"]
 # ==========================================================
 # DYNAMODB TABLES
 # ==========================================================
@@ -1529,6 +1531,344 @@ def delete_tenant_async(event, context):
             }
         )
 # ==========================================================
+# GET /tenants/{tenant_id}/backup
+# ==========================================================
+
+def run_tenant_backup(event, context):
+    """
+    Invoke TenantBackupFunction synchronously.
+
+    The backup worker itself starts the long-running SSM command
+    and returns HTTP 202 immediately with a backup_id.
+    """
+
+    path_parameters = event.get("pathParameters") or {}
+    tenant_id = path_parameters.get("tenant_id")
+
+    if not tenant_id:
+        return make_response(
+            400,
+            {
+                "message": "tenant_id is required"
+            }
+        )
+
+    try:
+        backup_event = {
+            "tenant_id": str(tenant_id).strip()
+        }
+
+        response = lambda_client.invoke(
+            FunctionName=BACKUP_FUNCTION_NAME,
+            InvocationType="RequestResponse",
+            Payload=json.dumps(
+                backup_event
+            ).encode("utf-8")
+        )
+
+        payload = response["Payload"].read()
+
+        if not payload:
+            log_event(
+                "tenant_backup_worker_empty_response",
+                tenant_id=tenant_id
+            )
+
+            return make_response(
+                502,
+                {
+                    "message": "Tenant backup worker returned an empty response",
+                    "tenant_id": tenant_id
+                }
+            )
+
+        worker_response = json.loads(payload)
+
+        if response.get("FunctionError"):
+            log_event(
+                "tenant_backup_worker_failed",
+                tenant_id=tenant_id
+            )
+
+            return make_response(
+                502,
+                {
+                    "message": "Tenant backup worker failed",
+                    "tenant_id": tenant_id
+                }
+            )
+
+        status_code = int(
+            worker_response.get(
+                "statusCode",
+                500
+            )
+        )
+
+        worker_body = worker_response.get(
+            "body",
+            {}
+        )
+
+        if isinstance(worker_body, str):
+            try:
+                worker_body = json.loads(worker_body)
+            except json.JSONDecodeError:
+                worker_body = {
+                    "message": worker_body
+                }
+
+        log_event(
+            "tenant_backup_route_completed",
+            tenant_id=tenant_id,
+            status_code=status_code
+        )
+
+        return make_response(
+            status_code,
+            worker_body
+        )
+
+    except ClientError as error:
+        error_code = (
+            error.response
+            .get("Error", {})
+            .get("Code", "Unknown")
+        )
+
+        log_event(
+            "tenant_backup_api_failed",
+            tenant_id=tenant_id,
+            error_code=error_code
+        )
+
+        return make_response(
+            500,
+            {
+                "message": "Failed to start tenant backup",
+                "tenant_id": tenant_id,
+                "error_code": error_code
+            }
+        )
+
+    except Exception as error:
+        log_event(
+            "tenant_backup_api_failed",
+            tenant_id=tenant_id,
+            error_type=type(error).__name__
+        )
+
+        print(
+            "Tenant backup API failed: "
+            f"{type(error).__name__}: {error}"
+        )
+
+        return make_response(
+            500,
+            {
+                "message": "Failed to start tenant backup",
+                "tenant_id": tenant_id
+            }
+        )
+
+
+# ==========================================================
+# POST /tenants/{tenant_id}/restore
+# ==========================================================
+
+def run_tenant_restore(event, context):
+    """
+    Invoke TenantRestoreFunction synchronously.
+
+    Request body:
+        {
+            "backup_id": "<backup-id>"
+        }
+
+    The restore worker validates the backup object and starts
+    the long-running SSM restore command.
+    """
+
+    path_parameters = event.get("pathParameters") or {}
+    tenant_id = path_parameters.get("tenant_id")
+
+    if not tenant_id:
+        return make_response(
+            400,
+            {
+                "message": "tenant_id is required"
+            }
+        )
+
+    try:
+        body = parse_body(event)
+        backup_id = body.get("backup_id")
+
+        if not isinstance(backup_id, str):
+            return make_response(
+                400,
+                {
+                    "message": "backup_id is required and must be a string"
+                }
+            )
+
+        backup_id = backup_id.strip()
+
+        if not backup_id:
+            return make_response(
+                400,
+                {
+                    "message": "backup_id cannot be empty"
+                }
+            )
+
+        # Defense-in-depth: backup IDs are generated UUIDs and must
+        # never be allowed to contain path separators.
+        if (
+            "/" in backup_id
+            or "\\" in backup_id
+            or ".." in backup_id
+        ):
+            return make_response(
+                400,
+                {
+                    "message": "Invalid backup_id"
+                }
+            )
+
+        restore_event = {
+            "tenant_id": str(tenant_id).strip(),
+            "backup_id": backup_id
+        }
+
+        response = lambda_client.invoke(
+            FunctionName=RESTORE_FUNCTION_NAME,
+            InvocationType="RequestResponse",
+            Payload=json.dumps(
+                restore_event
+            ).encode("utf-8")
+        )
+
+        payload = response["Payload"].read()
+
+        if not payload:
+            log_event(
+                "tenant_restore_worker_empty_response",
+                tenant_id=tenant_id,
+                backup_id=backup_id
+            )
+
+            return make_response(
+                502,
+                {
+                    "message": "Tenant restore worker returned an empty response",
+                    "tenant_id": tenant_id,
+                    "backup_id": backup_id
+                }
+            )
+
+        worker_response = json.loads(payload)
+
+        if response.get("FunctionError"):
+            log_event(
+                "tenant_restore_worker_failed",
+                tenant_id=tenant_id,
+                backup_id=backup_id
+            )
+
+            return make_response(
+                502,
+                {
+                    "message": "Tenant restore worker failed",
+                    "tenant_id": tenant_id,
+                    "backup_id": backup_id
+                }
+            )
+
+        status_code = int(
+            worker_response.get(
+                "statusCode",
+                500
+            )
+        )
+
+        worker_body = worker_response.get(
+            "body",
+            {}
+        )
+
+        if isinstance(worker_body, str):
+            try:
+                worker_body = json.loads(worker_body)
+            except json.JSONDecodeError:
+                worker_body = {
+                    "message": worker_body
+                }
+
+        log_event(
+            "tenant_restore_route_completed",
+            tenant_id=tenant_id,
+            backup_id=backup_id,
+            status_code=status_code
+        )
+
+        return make_response(
+            status_code,
+            worker_body
+        )
+
+    except ValueError as error:
+        return make_response(
+            400,
+            {
+                "message": str(error)
+            }
+        )
+
+    except ClientError as error:
+        error_code = (
+            error.response
+            .get("Error", {})
+            .get("Code", "Unknown")
+        )
+
+        log_event(
+            "tenant_restore_api_failed",
+            tenant_id=tenant_id,
+            error_code=error_code
+        )
+
+        return make_response(
+            500,
+            {
+                "message": "Failed to start tenant restore",
+                "tenant_id": tenant_id,
+                "error_code": error_code
+            }
+        )
+
+    except Exception as error:
+        log_event(
+            "tenant_restore_api_failed",
+            tenant_id=tenant_id,
+            error_type=type(error).__name__
+        )
+
+        print(
+            "Tenant restore API failed: "
+            f"{type(error).__name__}: {error}"
+        )
+
+        return make_response(
+            500,
+            {
+                "message": "Failed to start tenant restore",
+                "tenant_id": tenant_id
+            }
+        )
+
+
+# ==========================================================
 # GET /hosts
 # ==========================================================
 
@@ -1845,6 +2185,8 @@ def handler(event, context):
         GET  /tenants/{tenant_id}
         DELETE /tenants/{tenant_id}
         POST /tenants/{tenant_id}/query
+        GET  /tenants/{tenant_id}/backup
+        POST /tenants/{tenant_id}/restore
         GET  /jobs/{job_id}
         GET  /hosts
     """
@@ -1906,11 +2248,60 @@ def handler(event, context):
     )
 
     # ======================================================
-    # 1. POST /tenants/{tenant_id}/query
+    # 1. GET /tenants/{tenant_id}/backup
     # ======================================================
     #
     # IMPORTANT:
-    # Check this BEFORE the generic tenant routes.
+    # This must be checked BEFORE the generic
+    # GET /tenants/{tenant_id} route.
+    # ======================================================
+
+    if (
+        http_method == "GET"
+        and normalized_path.endswith("/backup")
+        and "/tenants/" in normalized_path
+    ):
+
+        log_event(
+            "tenant_backup_route_matched",
+            tenant_id=tenant_id,
+            path=path
+        )
+
+        return run_tenant_backup(
+            event,
+            context
+        )
+
+
+    # ======================================================
+    # 2. POST /tenants/{tenant_id}/restore
+    # ======================================================
+
+    if (
+        http_method == "POST"
+        and normalized_path.endswith("/restore")
+        and "/tenants/" in normalized_path
+    ):
+
+        log_event(
+            "tenant_restore_route_matched",
+            tenant_id=tenant_id,
+            path=path
+        )
+
+        return run_tenant_restore(
+            event,
+            context
+        )
+
+
+    # ======================================================
+    # 3. POST /tenants/{tenant_id}/query
+    # ======================================================
+    #
+    # IMPORTANT:
+    # This must be checked BEFORE generic tenant routes.
     # ======================================================
 
     if (
@@ -1930,8 +2321,9 @@ def handler(event, context):
             context
         )
 
+
     # ======================================================
-    # 2. POST /tenants
+    # 4. POST /tenants
     # ======================================================
 
     if (
@@ -1949,8 +2341,9 @@ def handler(event, context):
             context
         )
 
+
     # ======================================================
-    # 3. GET /jobs/{job_id}
+    # 5. GET /jobs/{job_id}
     # ======================================================
 
     if (
@@ -1969,8 +2362,9 @@ def handler(event, context):
             context
         )
 
+
     # ======================================================
-    # 4. GET /hosts
+    # 6. GET /hosts
     # ======================================================
 
     if (
@@ -1987,6 +2381,50 @@ def handler(event, context):
             event,
             context
         )
+
+
+    # ======================================================
+    # 7. DELETE /tenants/{tenant_id}
+    # ======================================================
+
+    if (
+        http_method == "DELETE"
+        and "/tenants/" in normalized_path
+    ):
+
+        log_event(
+            "delete_tenant_route_matched",
+            tenant_id=tenant_id,
+            path=path
+        )
+
+        return delete_tenant_async(
+            event,
+            context
+        )
+
+
+    # ======================================================
+    # 8. GET /tenants/{tenant_id}
+    # ======================================================
+
+    if (
+        http_method == "GET"
+        and "/tenants/" in normalized_path
+    ):
+
+        log_event(
+            "get_tenant_route_matched",
+            tenant_id=tenant_id,
+            path=path
+        )
+
+        return get_tenant_details(
+            event,
+            context
+        )
+
+
     # ======================================================
     # DELETE /tenants/{tenant_id}
     # ======================================================

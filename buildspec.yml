@@ -1,0 +1,32 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.13
+
+    commands:
+      - echo "Installing Python dependencies..."
+      - python --version
+      - python -m pip install --upgrade pip
+      - python -m pip install -r src/requirements.txt
+      - python -m pip install pytest
+      - echo "Installing AWS SAM CLI..."
+      - python -m pip install aws-sam-cli
+      - sam --version
+
+  pre_build:
+    commands:
+      - echo "Running tests..."
+      - python -m pytest -v
+      - echo "Validating SAM template..."
+      - sam validate --region ap-south-1
+
+  build:
+    commands:
+      - echo "Building SAM application..."
+      - sam build --region ap-south-1
+
+  post_build:
+    commands:
+      - echo "Build completed successfully."

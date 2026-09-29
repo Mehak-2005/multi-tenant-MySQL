@@ -57,3 +57,5 @@ desktop.ini
 *.tfstate.*
 # Project test/request/response JSON files
 *.json
+!frontend/**/*.json
+!frontend/*.json

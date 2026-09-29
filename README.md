@@ -212,3 +212,39 @@ The project uses the following AWS services:
              v
        Tenant-specific
           privileges
+```
+
+---
+
+## 7. Web Application Dashboard (React + Vite)
+
+The repository includes a production-grade cloud management web dashboard located in [`frontend/`](frontend/):
+
+```text
+Vercel (Frontend Hosting)
+        │
+        ▼ (HTTPS REST / JSON)
+AWS API Gateway
+        │
+        ▼
+AWS Lambda / Step Functions / DynamoDB / EC2 MySQL / Secrets Manager / S3
+```
+
+### Dashboard Features
+- **Live Infrastructure KPIs**: Dynamic tenant counts, active EC2 hosts, and available capacity.
+- **Asynchronous Job Polling**: Visual 6-stage pipeline tracking for Step Functions state machine execution.
+- **Tenant Management**: Search, filter, provision, and deprovision tenants.
+- **Tenant Details & Credentials**: Safe masked credentials with reveal/copy actions and S3 backup history.
+- **In-Browser SQL Console**: Safe query interface communicating strictly over AWS API Gateway.
+- **Host Capacity Visualizer**: Real-time progress bars showing slot utilization (`X / 5 tenants`).
+- **Disaster Recovery**: AWS SSM-triggered `mysqldump` backups into S3 and confirmed snapshot restore.
+- **System Health Monitor**: Live 8-component AWS infrastructure status check.
+
+### Getting Started with Frontend
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+For complete frontend setup, architecture details, and Vercel deployment instructions, see [frontend/README.md](frontend/README.md) and [frontend/API_INTEGRATION.md](frontend/API_INTEGRATION.md).

@@ -4,6 +4,13 @@ Transform: AWS::Serverless-2016-10-31
 Description: >
   Multi-tenant MySQL Provisioning Service on AWS
 
+Globals:
+  Api:
+    Cors:
+      AllowMethods: "'GET,POST,DELETE,OPTIONS'"
+      AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+      AllowOrigin: "'*'"
+
 
 # ============================================================
 # PARAMETERS
@@ -1455,6 +1462,9 @@ Resources:
           ENVIRONMENT:
             !Ref Environment
 
+          BACKUP_BUCKET_NAME:
+            !Ref TenantBackupBucket
+
       Policies:
         - Statement:
             # ==================================================
@@ -1482,15 +1492,16 @@ Resources:
                 - dynamodb:PutItem
                 - dynamodb:UpdateItem
                 - dynamodb:GetItem
-
+                - dynamodb:Scan
               Resource:
                 !GetAtt JobsTable.Arn
             # ==================================================
-            # CHECK EXISTING TENANT
+            # CHECK / LIST EXISTING TENANTS
             # ==================================================
             - Effect: Allow
               Action:
                 - dynamodb:GetItem
+                - dynamodb:Scan
               Resource:
                 !GetAtt TenantsTable.Arn
             # ==================================================
@@ -1501,6 +1512,14 @@ Resources:
                 - dynamodb:Scan
               Resource:
                 !GetAtt HostsTable.Arn
+            # ==================================================
+            # LIST TENANT S3 BACKUPS
+            # ==================================================
+            - Effect: Allow
+              Action:
+                - s3:ListBucket
+              Resource:
+                !GetAtt TenantBackupBucket.Arn
                         # ==================================================
             # INVOKE TENANT DEPROVISIONER
             # ==================================================
@@ -1631,6 +1650,50 @@ Resources:
           Properties:
             Path: /tenants/{tenant_id}/restore
             Method: post
+
+        # ------------------------------------------------------
+        # GET /tenants
+        # ------------------------------------------------------
+
+        ListTenantsApi:
+          Type: Api
+
+          Properties:
+            Path: /tenants
+            Method: get
+
+        # ------------------------------------------------------
+        # GET /jobs
+        # ------------------------------------------------------
+
+        ListJobsApi:
+          Type: Api
+
+          Properties:
+            Path: /jobs
+            Method: get
+
+        # ------------------------------------------------------
+        # GET /health
+        # ------------------------------------------------------
+
+        HealthCheckApi:
+          Type: Api
+
+          Properties:
+            Path: /health
+            Method: get
+
+        # ------------------------------------------------------
+        # GET /tenants/{tenant_id}/backups
+        # ------------------------------------------------------
+
+        ListTenantBackupsApi:
+          Type: Api
+
+          Properties:
+            Path: /tenants/{tenant_id}/backups
+            Method: get
   # ==========================================================
   # HOST PROVISIONING STATE MACHINE
   # ==========================================================

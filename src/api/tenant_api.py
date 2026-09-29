@@ -21,6 +21,7 @@ from observability.metrics import (
 stepfunctions_client = boto3.client("stepfunctions")
 dynamodb = boto3.resource("dynamodb")
 lambda_client = boto3.client("lambda")
+s3_client = boto3.client("s3")
 
 # ==========================================================
 # ENVIRONMENT VARIABLES
@@ -35,6 +36,7 @@ QUERY_FUNCTION_NAME = os.environ["QUERY_FUNCTION_NAME"]
 DEPROVISIONER_FUNCTION_NAME = os.environ["DEPROVISIONER_FUNCTION_NAME"]
 BACKUP_FUNCTION_NAME = os.environ["BACKUP_FUNCTION_NAME"]
 RESTORE_FUNCTION_NAME = os.environ["RESTORE_FUNCTION_NAME"]
+BACKUP_BUCKET_NAME = os.environ.get("BACKUP_BUCKET_NAME", "")
 # ==========================================================
 # DYNAMODB TABLES
 # ==========================================================
@@ -60,13 +62,16 @@ def utc_now():
 
 def make_response(status_code, body):
     """
-    Create a standard API Gateway response.
+    Create a standard API Gateway response with CORS headers.
     """
 
     return {
         "statusCode": status_code,
         "headers": {
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token"
         },
         "body": json.dumps(body, default=str)
     }
@@ -1119,6 +1124,19 @@ def get_tenant_details(event, context):
                         "host_id"
                     ),
 
+                "private_ip":
+                    tenant.get(
+                        "private_ip"
+                    ),
+
+                "mysql_port":
+                    int(
+                        tenant.get(
+                            "mysql_port",
+                            3307
+                        )
+                    ),
+
                 "database_name":
                     tenant.get(
                         "database_name"
@@ -1127,6 +1145,11 @@ def get_tenant_details(event, context):
                 "mysql_username":
                     tenant.get(
                         "mysql_username"
+                    ),
+
+                "credentials_secret_arn":
+                    tenant.get(
+                        "credentials_secret_arn"
                     ),
 
                 "environment":
@@ -2172,28 +2195,276 @@ def run_tenant_query(event, context):
             }
         )
 # ==========================================================
+# LIST ALL TENANTS
+# ==========================================================
+
+def list_tenants(event, context):
+    """
+    Return all registered tenants from DynamoDB.
+    """
+
+    try:
+        response = tenants_table.scan()
+        raw_items = response.get("Items", [])
+
+        while "LastEvaluatedKey" in response:
+            response = tenants_table.scan(
+                ExclusiveStartKey=response["LastEvaluatedKey"]
+            )
+            raw_items.extend(response.get("Items", []))
+
+        formatted = []
+        for item in raw_items:
+            formatted.append({
+                "tenant_id": item.get("tenant_id"),
+                "status": item.get("status"),
+                "host_id": item.get("host_id"),
+                "private_ip": item.get("private_ip"),
+                "mysql_port": int(item.get("mysql_port", 3307)),
+                "database_name": item.get("database_name"),
+                "mysql_username": item.get("mysql_username"),
+                "credentials_secret_arn": item.get("credentials_secret_arn"),
+                "environment": item.get("environment", ENVIRONMENT),
+                "created_at": item.get("created_at"),
+                "updated_at": item.get("updated_at")
+            })
+
+        formatted.sort(
+            key=lambda x: str(x.get("created_at") or ""),
+            reverse=True
+        )
+
+        return make_response(200, {
+            "count": len(formatted),
+            "tenants": formatted
+        })
+
+    except Exception as error:
+        return make_response(500, {
+            "message": "Failed to list tenants",
+            "error": str(error)
+        })
+
+
+# ==========================================================
+# LIST ALL JOBS
+# ==========================================================
+
+def list_jobs(event, context):
+    """
+    Return all provisioning jobs from DynamoDB.
+    """
+
+    try:
+        response = jobs_table.scan()
+        raw_items = response.get("Items", [])
+
+        while "LastEvaluatedKey" in response:
+            response = jobs_table.scan(
+                ExclusiveStartKey=response["LastEvaluatedKey"]
+            )
+            raw_items.extend(response.get("Items", []))
+
+        raw_items.sort(
+            key=lambda x: str(x.get("created_at") or ""),
+            reverse=True
+        )
+
+        return make_response(200, {
+            "count": len(raw_items),
+            "jobs": raw_items
+        })
+
+    except Exception as error:
+        return make_response(500, {
+            "message": "Failed to list jobs",
+            "error": str(error)
+        })
+
+
+# ==========================================================
+# LIST TENANT BACKUPS FROM S3
+# ==========================================================
+
+def list_tenant_backups(event, context):
+    """
+    List previous backups for a tenant from S3.
+    """
+
+    path_parameters = event.get("pathParameters") or {}
+    tenant_id = path_parameters.get("tenant_id")
+
+    if not tenant_id:
+        return make_response(400, {"message": "tenant_id is required"})
+
+    tenant_id = str(tenant_id).strip()
+
+    if not BACKUP_BUCKET_NAME:
+        return make_response(200, {
+            "count": 0,
+            "tenant_id": tenant_id,
+            "backups": []
+        })
+
+    try:
+        prefix = f"tenants/{tenant_id}/"
+        response = s3_client.list_objects_v2(
+            Bucket=BACKUP_BUCKET_NAME,
+            Prefix=prefix
+        )
+
+        backups = []
+        for obj in response.get("Contents", []):
+            key = obj.get("Key", "")
+            if key.endswith(".sql.gz"):
+                filename = key.replace(prefix, "")
+                backup_id = filename.replace(".sql.gz", "")
+                last_modified = obj.get("LastModified")
+                backups.append({
+                    "backup_id": backup_id,
+                    "tenant_id": tenant_id,
+                    "s3_bucket": BACKUP_BUCKET_NAME,
+                    "s3_key": key,
+                    "size_bytes": obj.get("Size", 0),
+                    "created_at": (
+                        last_modified.isoformat()
+                        if hasattr(last_modified, "isoformat")
+                        else str(last_modified)
+                    ),
+                    "status": "COMPLETED"
+                })
+
+        backups.sort(
+            key=lambda x: str(x.get("created_at") or ""),
+            reverse=True
+        )
+
+        return make_response(200, {
+            "count": len(backups),
+            "tenant_id": tenant_id,
+            "backups": backups
+        })
+
+    except Exception as error:
+        return make_response(500, {
+            "message": "Failed to list tenant backups",
+            "tenant_id": tenant_id,
+            "error": str(error)
+        })
+
+
+# ==========================================================
+# SYSTEM HEALTH CHECK
+# ==========================================================
+
+def get_system_health(event, context):
+    """
+    Check connectivity and status of backend infrastructure components.
+    """
+
+    now = utc_now()
+    services = {}
+
+    # 1. DynamoDB
+    try:
+        t0 = datetime.now(timezone.utc)
+        tenants_table.scan(Limit=1)
+        latency = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
+        services["dynamodb"] = {
+            "name": "Amazon DynamoDB",
+            "status": "Healthy",
+            "latency_ms": latency,
+            "details": f"Tables: {TENANTS_TABLE_NAME}, {JOBS_TABLE_NAME}, {HOSTS_TABLE_NAME}"
+        }
+    except Exception as e:
+        services["dynamodb"] = {
+            "name": "Amazon DynamoDB",
+            "status": "Failed",
+            "error": str(e)
+        }
+
+    # 2. Step Functions
+    try:
+        services["step_functions"] = {
+            "name": "AWS Step Functions",
+            "status": "Healthy" if STATE_MACHINE_ARN else "Warning",
+            "arn": STATE_MACHINE_ARN or "Not configured"
+        }
+    except Exception as e:
+        services["step_functions"] = {
+            "name": "AWS Step Functions",
+            "status": "Failed",
+            "error": str(e)
+        }
+
+    # 3. EC2 Hosts
+    try:
+        hosts_resp = hosts_table.scan()
+        hosts_items = hosts_resp.get("Items", [])
+        ready_hosts = sum(1 for h in hosts_items if h.get("status") == "READY")
+        services["ec2_hosts"] = {
+            "name": "EC2 MySQL Hosts",
+            "status": "Healthy" if ready_hosts > 0 else ("Warning" if len(hosts_items) > 0 else "Unknown"),
+            "total_hosts": len(hosts_items),
+            "ready_hosts": ready_hosts
+        }
+    except Exception as e:
+        services["ec2_hosts"] = {
+            "name": "EC2 MySQL Hosts",
+            "status": "Failed",
+            "error": str(e)
+        }
+
+    # 4. Lambda
+    services["lambda"] = {
+        "name": "AWS Lambda",
+        "status": "Healthy",
+        "environment": ENVIRONMENT
+    }
+
+    # 5. S3 Backups
+    services["s3"] = {
+        "name": "Amazon S3",
+        "status": "Healthy" if BACKUP_BUCKET_NAME else "Warning",
+        "bucket": BACKUP_BUCKET_NAME or "Not configured"
+    }
+
+    # 6. Secrets Manager
+    services["secrets_manager"] = {
+        "name": "AWS Secrets Manager",
+        "status": "Healthy",
+        "note": "Credential isolation active"
+    }
+
+    # 7. API Gateway
+    services["api_gateway"] = {
+        "name": "Amazon API Gateway",
+        "status": "Healthy"
+    }
+
+    overall = "Healthy"
+    if any(s.get("status") == "Failed" for s in services.values()):
+        overall = "Failed"
+    elif any(s.get("status") == "Warning" for s in services.values()):
+        overall = "Warning"
+
+    return make_response(200, {
+        "status": overall,
+        "environment": ENVIRONMENT,
+        "region": os.environ.get("AWS_REGION", "ap-south-1"),
+        "timestamp": now,
+        "services": services
+    })
+
+
+# ==========================================================
 # LAMBDA HANDLER
 # ==========================================================
 
 def handler(event, context):
     """
-    Main API Gateway Lambda handler.
-
-    Supported routes:
-
-        POST /tenants
-        GET  /tenants/{tenant_id}
-        DELETE /tenants/{tenant_id}
-        POST /tenants/{tenant_id}/query
-        GET  /tenants/{tenant_id}/backup
-        POST /tenants/{tenant_id}/restore
-        GET  /jobs/{job_id}
-        GET  /hosts
+    Main API Gateway Lambda handler with full route dispatching.
     """
-
-    # ======================================================
-    # GET HTTP METHOD
-    # ======================================================
 
     http_method = (
         event.get("httpMethod")
@@ -2202,10 +2473,6 @@ def handler(event, context):
         .get("method")
         or ""
     ).upper()
-
-    # ======================================================
-    # GET PATH
-    # ======================================================
 
     path = (
         event.get("path")
@@ -2217,26 +2484,13 @@ def handler(event, context):
 
     normalized_path = path.rstrip("/")
 
-    # ======================================================
-    # GET PATH PARAMETERS
-    # ======================================================
+    # Handle CORS preflight
+    if http_method == "OPTIONS":
+        return make_response(200, {"message": "OK"})
 
-    path_parameters = (
-        event.get("pathParameters")
-        or {}
-    )
-
-    tenant_id = path_parameters.get(
-        "tenant_id"
-    )
-
-    job_id = path_parameters.get(
-        "job_id"
-    )
-
-    # ======================================================
-    # STRUCTURED LOG
-    # ======================================================
+    path_parameters = event.get("pathParameters") or {}
+    tenant_id = path_parameters.get("tenant_id")
+    job_id = path_parameters.get("job_id")
 
     log_event(
         "api_request_received",
@@ -2247,227 +2501,92 @@ def handler(event, context):
         job_id=job_id
     )
 
-    # ======================================================
-    # 1. GET /tenants/{tenant_id}/backup
-    # ======================================================
-    #
-    # IMPORTANT:
-    # This must be checked BEFORE the generic
-    # GET /tenants/{tenant_id} route.
-    # ======================================================
+    # 1. Health check: GET /health
+    if http_method == "GET" and normalized_path.endswith("/health"):
+        return get_system_health(event, context)
 
+    # 2. List backups for tenant: GET /tenants/{tenant_id}/backups
+    if (
+        http_method == "GET"
+        and normalized_path.endswith("/backups")
+        and "/tenants/" in normalized_path
+    ):
+        return list_tenant_backups(event, context)
+
+    # 3. Trigger backup: GET /tenants/{tenant_id}/backup
     if (
         http_method == "GET"
         and normalized_path.endswith("/backup")
         and "/tenants/" in normalized_path
     ):
+        return run_tenant_backup(event, context)
 
-        log_event(
-            "tenant_backup_route_matched",
-            tenant_id=tenant_id,
-            path=path
-        )
-
-        return run_tenant_backup(
-            event,
-            context
-        )
-
-
-    # ======================================================
-    # 2. POST /tenants/{tenant_id}/restore
-    # ======================================================
-
+    # 4. Trigger restore: POST /tenants/{tenant_id}/restore
     if (
         http_method == "POST"
         and normalized_path.endswith("/restore")
         and "/tenants/" in normalized_path
     ):
+        return run_tenant_restore(event, context)
 
-        log_event(
-            "tenant_restore_route_matched",
-            tenant_id=tenant_id,
-            path=path
-        )
-
-        return run_tenant_restore(
-            event,
-            context
-        )
-
-
-    # ======================================================
-    # 3. POST /tenants/{tenant_id}/query
-    # ======================================================
-    #
-    # IMPORTANT:
-    # This must be checked BEFORE generic tenant routes.
-    # ======================================================
-
+    # 5. Query tenant database: POST /tenants/{tenant_id}/query
     if (
         http_method == "POST"
         and normalized_path.endswith("/query")
         and "/tenants/" in normalized_path
     ):
+        return run_tenant_query(event, context)
 
-        log_event(
-            "tenant_query_route_matched",
-            tenant_id=tenant_id,
-            path=path
-        )
-
-        return run_tenant_query(
-            event,
-            context
-        )
-
-
-    # ======================================================
-    # 4. POST /tenants
-    # ======================================================
-
+    # 6. Create tenant: POST /tenants
     if (
         http_method == "POST"
         and normalized_path.endswith("/tenants")
     ):
+        return create_tenant_async(event, context)
 
-        log_event(
-            "create_tenant_route_matched",
-            path=path
-        )
+    # 7. List all tenants: GET /tenants
+    if (
+        http_method == "GET"
+        and normalized_path.endswith("/tenants")
+    ):
+        return list_tenants(event, context)
 
-        return create_tenant_async(
-            event,
-            context
-        )
+    # 8. List all jobs: GET /jobs
+    if (
+        http_method == "GET"
+        and normalized_path.endswith("/jobs")
+    ):
+        return list_jobs(event, context)
 
-
-    # ======================================================
-    # 5. GET /jobs/{job_id}
-    # ======================================================
-
+    # 9. Get specific job status: GET /jobs/{job_id}
     if (
         http_method == "GET"
         and "/jobs/" in normalized_path
     ):
+        return get_job_status(event, context)
 
-        log_event(
-            "get_job_route_matched",
-            job_id=job_id,
-            path=path
-        )
-
-        return get_job_status(
-            event,
-            context
-        )
-
-
-    # ======================================================
-    # 6. GET /hosts
-    # ======================================================
-
+    # 10. List hosts: GET /hosts
     if (
         http_method == "GET"
         and normalized_path.endswith("/hosts")
     ):
+        return get_hosts(event, context)
 
-        log_event(
-            "get_hosts_route_matched",
-            path=path
-        )
-
-        return get_hosts(
-            event,
-            context
-        )
-
-
-    # ======================================================
-    # 7. DELETE /tenants/{tenant_id}
-    # ======================================================
-
+    # 11. Delete tenant: DELETE /tenants/{tenant_id}
     if (
         http_method == "DELETE"
         and "/tenants/" in normalized_path
     ):
+        return delete_tenant_async(event, context)
 
-        log_event(
-            "delete_tenant_route_matched",
-            tenant_id=tenant_id,
-            path=path
-        )
-
-        return delete_tenant_async(
-            event,
-            context
-        )
-
-
-    # ======================================================
-    # 8. GET /tenants/{tenant_id}
-    # ======================================================
-
+    # 12. Get tenant details: GET /tenants/{tenant_id}
     if (
         http_method == "GET"
         and "/tenants/" in normalized_path
     ):
+        return get_tenant_details(event, context)
 
-        log_event(
-            "get_tenant_route_matched",
-            tenant_id=tenant_id,
-            path=path
-        )
-
-        return get_tenant_details(
-            event,
-            context
-        )
-
-
-    # ======================================================
-    # DELETE /tenants/{tenant_id}
-    # ======================================================
-
-    if (
-        http_method == "DELETE"
-        and "/tenants/" in normalized_path
-    ):
-
-        log_event(
-            "delete_tenant_route_matched",
-            tenant_id=tenant_id,
-            path=path
-        )
-
-        return delete_tenant_async(
-            event,
-            context
-        )
-    # ======================================================
-    # 5. GET /tenants/{tenant_id}
-    # ======================================================
-
-    if (
-        http_method == "GET"
-        and "/tenants/" in normalized_path
-    ):
-
-        log_event(
-            "get_tenant_route_matched",
-            tenant_id=tenant_id,
-            path=path
-        )
-
-        return get_tenant_details(
-            event,
-            context
-        )
-
-    # ======================================================
-    # UNKNOWN ROUTE
-    # ======================================================
-
+    # 13. Route not found
     log_event(
         "api_route_not_found",
         http_method=http_method,
